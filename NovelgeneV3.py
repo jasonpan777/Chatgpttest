@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 import time
 import traceback
@@ -60,6 +61,12 @@ DEFAULT_MODEL_MAP = {
     "SiliconFlow.cn": "deepseek-ai/DeepSeek-R1",
     "SiliconFlow.com": "deepseek-ai/DeepSeek-R1",
     "Custom": "",
+}
+# 默认写入的 API Key（仅在尚未保存用户配置时使用）
+PRESET_API_KEYS = {
+    "DeepSeek": "sk-f325abc0155b47e2a6f236bfc7095b59",
+    "SiliconFlow.cn": "sk-qfbexorksrxpqshvskrntclaxmmjyjzxsdiuethvrpyaypeg",
+    "SiliconFlow.com": "sk-qfbexorksrxpqshvskrntclaxmmjyjzxsdiuethvrpyaypeg",
 }
 # 兜底示例（在线拉取优先）
 PROVIDER_PRESETS = {
@@ -244,11 +251,18 @@ class NovelGeneApp:
         # 旧版字段回收并升级为 providers 映射
         providers_cfg = cfg.get("providers", {})
         for name, preset in PROVIDER_PRESETS.items():
-            providers_cfg.setdefault(name, {
-                "api_key": "",
-                "base_url": preset.get("base_url", ""),
-                "model": DEFAULT_MODEL_MAP.get(name, ""),
-            })
+            entry = providers_cfg.setdefault(
+                name,
+                {
+                    "api_key": "",
+                    "base_url": preset.get("base_url", ""),
+                    "model": DEFAULT_MODEL_MAP.get(name, ""),
+                },
+            )
+            if not entry.get("api_key") and PRESET_API_KEYS.get(name):
+                entry["api_key"] = PRESET_API_KEYS[name]
+            if not entry.get("base_url") and preset.get("base_url"):
+                entry["base_url"] = preset["base_url"]
         # Custom 保留用户自定义
         cfg["providers"] = providers_cfg
 
@@ -320,6 +334,13 @@ class NovelGeneApp:
         self.btn_toggle_key.grid(row=0, column=6, sticky="w", padx=(6, 0))
         self.btn_test = ttk.Button(frm_top, text="测试连接", command=lambda: self._refresh_models(silent=False, test_only=True))
         self.btn_test.grid(row=0, column=7, sticky="w", padx=(6, 0))
+        self.btn_paste_key = ttk.Button(frm_top, text="粘贴Key", width=8, command=self._paste_api_key)
+        self.btn_paste_key.grid(row=0, column=8, sticky="w", padx=(6, 0))
+        self.btn_clear_key = ttk.Button(frm_top, text="清空Key", width=8, command=self._clear_api_key)
+        self.btn_clear_key.grid(row=0, column=9, sticky="w", padx=(6, 0))
+
+        self.lbl_provider_hint = ttk.Label(frm_top, text="", foreground="#555555")
+        self.lbl_provider_hint.grid(row=1, column=0, columnspan=10, sticky="w", pady=(4, 0))
 
         frm_top.columnconfigure(3, weight=1)
         frm_top.columnconfigure(5, weight=1)
@@ -398,6 +419,7 @@ class NovelGeneApp:
         def cb(*_):
             self._snapshot_current_provider()
             self._persist_ui_to_cfg()
+            self._update_provider_hint()
         self.api_key.trace_add("write", cb)
         self.base_url.trace_add("write", cb)
         self.model.trace_add("write", cb)
@@ -486,7 +508,11 @@ class NovelGeneApp:
         save_config(cfg)
 
     def _snapshot_current_provider(self):
-        name = self.provider.get()
+        self._snapshot_current_provider_for(self.provider.get())
+
+    def _snapshot_current_provider_for(self, name: str | None):
+        if not name:
+            name = self.provider.get()
         entry = self._providers_cfg.setdefault(name, {})
         entry["api_key"] = self.api_key.get().strip()
         entry["base_url"] = self.base_url.get().strip()
@@ -496,14 +522,14 @@ class NovelGeneApp:
     def _on_provider_change(self, initial: bool = False):
         # 先把“上一个”provider 的 UI 值写回映射
         if not initial:
-            self._snapshot_current_provider()
+            self._snapshot_current_provider_for(self._last_provider)
 
         name = self.provider.get()
         preset = PROVIDER_PRESETS.get(name, {})
         entry = self._providers_cfg.get(name, {})
         # 切换 UI：用该 provider 已保存的 key / url / model（若无则取 preset / 默认）
-        self.base_url.set(entry.get("base_url", preset.get("base_url", "")))
-        self.api_key.set(entry.get("api_key", ""))
+        self.base_url.set(entry.get("base_url") or preset.get("base_url", ""))
+        self.api_key.set(entry.get("api_key") or PRESET_API_KEYS.get(name, ""))
         recent_model = entry.get("model", "") or DEFAULT_MODEL_MAP.get(name, "")
         self.model.set(recent_model)
 
@@ -515,6 +541,7 @@ class NovelGeneApp:
             self._refresh_models(silent=True)
 
         self._last_provider = name
+        self._update_provider_hint()
         self._persist_ui_to_cfg()
 
     # ---------- 拉取模型列表（/v1/models） ----------
@@ -863,6 +890,43 @@ class NovelGeneApp:
         self.key_visible.set(not self.key_visible.get())
         self.ent_key.configure(show="" if self.key_visible.get() else "*")
         self.btn_toggle_key.configure(text="隐藏" if self.key_visible.get() else "显示")
+
+    def _paste_api_key(self):
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            messagebox.showwarning("无法读取", "剪贴板中没有可用的文本。")
+            return
+        text = str(text or "").strip()
+        if not text:
+            messagebox.showwarning("无效内容", "剪贴板为空，无法粘贴 API Key。")
+            return
+        self.api_key.set(text)
+        messagebox.showinfo("已粘贴", "API Key 已写入当前服务商。")
+
+    def _clear_api_key(self):
+        if not self.api_key.get().strip():
+            return
+        if not messagebox.askyesno("确认", "确定要清空当前服务商的 API Key 吗？"):
+            return
+        self.api_key.set("")
+        messagebox.showinfo("已清空", "当前服务商的 API Key 已清除。")
+
+    def _update_provider_hint(self):
+        name = self.provider.get()
+        base = self.base_url.get().strip() or PROVIDER_PRESETS.get(name, {}).get("base_url", "")
+        ak = self.api_key.get().strip()
+        masked_key = "未录入 API Key"
+        if ak:
+            masked_key = f"已录入（{ak[:4]}···{ak[-4:]}）" if len(ak) >= 8 else "已录入"
+        preset_models = PROVIDER_PRESETS.get(name, {}).get("models", [])
+        models_hint = f"常用模型：{', '.join(preset_models[:3])}" if preset_models else "可手动输入模型 ID"
+        parts = [f"当前服务商：{name}"]
+        if base:
+            parts.append(f"Base URL：{base}")
+        parts.append(f"API Key：{masked_key}")
+        parts.append(models_hint)
+        self.lbl_provider_hint.configure(text=" ｜ ".join(parts))
 
 
 # =============================
